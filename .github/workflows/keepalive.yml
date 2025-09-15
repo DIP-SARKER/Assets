@@ -1,7 +1,7 @@
 name: Keep Portfolio Alive
 
 on:
-  # every 4h
+  # Check every 8 hours (you can tweak this cron as you like)
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
@@ -16,7 +16,8 @@ jobs:
     env:
       TARGET_URL: ${{ vars.PORTFOLIO_URL }}
       STATE_FILE: .github/keepalive.json
-      LOG_FILE: ${{ vars.KEEPALIVE_LOG_PATH || 'docs/keepalive-log.md' }}
+      # No default here—let the script default if this var is empty:
+      LOG_FILE: ${{ vars.KEEPALIVE_LOG_PATH }}
       DEFAULT_BRANCH: main
     steps:
       - name: Check out main
@@ -83,10 +84,8 @@ jobs:
               ["bash","-lc", f'code=$(curl -sSL -m 15 -o /dev/null -w "%{{http_code}}" "{url}"); echo "$code"'],
               check=True, capture_output=True, text=True
             )
-            http_status = result.stdout.strip()
-            if http_status == "":
-              http_status = "unknown"
-            if not http_status.isdigit() or int(http_status) >= 400:
+            http_status = result.stdout.strip() or "unknown"
+            if (not http_status.isdigit()) or int(http_status) >= 400:
               ping_status = f"failed_http_{http_status}"
           except subprocess.CalledProcessError as e:
             ping_status = f"failed_curl_{e.returncode}"
@@ -116,19 +115,22 @@ jobs:
 
       - name: Append log and commit to main
         if: steps.decide.outputs.did_update == 'true'
+        shell: bash
         run: |
           set -euo pipefail
 
-          # Prepare log line
+          # Use a safe default path if the repo variable is empty
+          LOG_PATH="${LOG_FILE:-docs/keepalive-log.md}"
+
           NOW="${{ steps.decide.outputs.now_iso }}"
           NEXT="${{ steps.decide.outputs.next_run_iso }}"
           STATUS="${{ steps.decide.outputs.ping_status }}"
           HTTP="${{ steps.decide.outputs.http_status }}"
           URL="${{ env.TARGET_URL }}"
 
-          mkdir -p "$(dirname "$LOG_FILE")"
-          if [ ! -f "$LOG_FILE" ]; then
-            cat > "$LOG_FILE" <<EOF
+          mkdir -p "$(dirname "$LOG_PATH")"
+          if [ ! -f "$LOG_PATH" ]; then
+            cat > "$LOG_PATH" <<EOF
 # Keepalive Log
 
 This file is updated whenever the keepalive workflow actually **pings** the portfolio (randomly every 120–144 hours).
@@ -138,10 +140,10 @@ This file is updated whenever the keepalive workflow actually **pings** the port
 EOF
           fi
 
-          echo "| $NOW | $STATUS | $HTTP | $NEXT | $URL |" >> "$LOG_FILE"
+          echo "| $NOW | $STATUS | $HTTP | $NEXT | $URL |" >> "$LOG_PATH"
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "$LOG_FILE" "$STATE_FILE"
+          git add "$LOG_PATH" "$STATE_FILE"
           git commit -m "keepalive: $STATUS (HTTP $HTTP) · next: $NEXT"
           git push origin "${{ env.DEFAULT_BRANCH }}"
