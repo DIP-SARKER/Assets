@@ -1,0 +1,147 @@
+name: Keep Portfolio Alive
+
+on:
+  # every 4h
+  schedule:
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write    # to commit the state/log to main
+  actions: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_URL: ${{ vars.PORTFOLIO_URL }}
+      STATE_FILE: .github/keepalive.json
+      LOG_FILE: ${{ vars.KEEPALIVE_LOG_PATH || 'docs/keepalive-log.md' }}
+      DEFAULT_BRANCH: main
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.DEFAULT_BRANCH }}
+          fetch-depth: 0
+
+      - name: Decide, ping if due, and update schedule
+        id: decide
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - << 'PY'
+          import os, json, random, datetime, subprocess, sys, pathlib
+
+          tz = datetime.timezone.utc
+          now = datetime.datetime.now(tz)
+          state_path = os.environ["STATE_FILE"]
+          url = os.environ.get("TARGET_URL","").strip()
+
+          gh_out = os.environ.get("GITHUB_OUTPUT")
+
+          def write_output(k, v):
+            if gh_out:
+              with open(gh_out, "a") as f:
+                f.write(f"{k}={v}\n")
+
+          if not url:
+            print("ERROR: TARGET_URL (repo variable PORTFOLIO_URL) not set.", file=sys.stderr)
+            write_output("did_update", "false")
+            write_output("reason", "missing_url")
+            sys.exit(0)
+
+          p = pathlib.Path(state_path)
+          state = {}
+          if p.exists():
+            try:
+              state = json.loads(p.read_text())
+            except Exception:
+              state = {}
+
+          def parse_iso(s):
+            try:
+              return datetime.datetime.fromisoformat(s.replace("Z","+00:00"))
+            except Exception:
+              return None
+
+          next_run = parse_iso(state.get("next_run","")) if state else None
+          due = (next_run is None) or (datetime.datetime.now(tz) >= next_run)
+
+          if not due:
+            write_output("did_update", "false")
+            write_output("reason", "not_due")
+            write_output("next_run_iso", next_run.isoformat())
+            sys.exit(0)
+
+          # Perform the ping
+          ping_status = "success"
+          http_status = ""
+          try:
+            # -s silent, -S show errors, -L follow redirects, -m 15 timeout, -w to capture code
+            result = subprocess.run(
+              ["bash","-lc", f'code=$(curl -sSL -m 15 -o /dev/null -w "%{{http_code}}" "{url}"); echo "$code"'],
+              check=True, capture_output=True, text=True
+            )
+            http_status = result.stdout.strip()
+            if http_status == "":
+              http_status = "unknown"
+            if not http_status.isdigit() or int(http_status) >= 400:
+              ping_status = f"failed_http_{http_status}"
+          except subprocess.CalledProcessError as e:
+            ping_status = f"failed_curl_{e.returncode}"
+
+          # Schedule next run (random 120–144 hours)
+          hours = random.randint(120, 144)
+          next_time = now + datetime.timedelta(hours=hours)
+
+          new_state = {
+            "last_run": now.isoformat(),
+            "last_status": ping_status,
+            "http_status": http_status,
+            "next_run": next_time.isoformat(),
+            "window_hours": [120, 144],
+            "target_url": url
+          }
+          pathlib.Path(state_path).parent.mkdir(parents=True, exist_ok=True)
+          pathlib.Path(state_path).write_text(json.dumps(new_state, indent=2))
+
+          # Expose outputs for the commit step
+          write_output("did_update", "true")
+          write_output("now_iso", now.isoformat())
+          write_output("next_run_iso", next_time.isoformat())
+          write_output("ping_status", ping_status)
+          write_output("http_status", http_status)
+          PY
+
+      - name: Append log and commit to main
+        if: steps.decide.outputs.did_update == 'true'
+        run: |
+          set -euo pipefail
+
+          # Prepare log line
+          NOW="${{ steps.decide.outputs.now_iso }}"
+          NEXT="${{ steps.decide.outputs.next_run_iso }}"
+          STATUS="${{ steps.decide.outputs.ping_status }}"
+          HTTP="${{ steps.decide.outputs.http_status }}"
+          URL="${{ env.TARGET_URL }}"
+
+          mkdir -p "$(dirname "$LOG_FILE")"
+          if [ ! -f "$LOG_FILE" ]; then
+            cat > "$LOG_FILE" <<EOF
+# Keepalive Log
+
+This file is updated whenever the keepalive workflow actually **pings** the portfolio (randomly every 120–144 hours).
+
+| Timestamp (UTC) | Result | HTTP | Next Scheduled (UTC) | URL |
+|---|---|---|---|---|
+EOF
+          fi
+
+          echo "| $NOW | $STATUS | $HTTP | $NEXT | $URL |" >> "$LOG_FILE"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$LOG_FILE" "$STATE_FILE"
+          git commit -m "keepalive: $STATUS (HTTP $HTTP) · next: $NEXT"
+          git push origin "${{ env.DEFAULT_BRANCH }}"
